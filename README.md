@@ -1,413 +1,264 @@
-# Verschlüsselter Datei-Sync (PHP-Server + Rust-Client)
+# Encrypted File Sync (PHP Server + Rust Client)
 
-Dieses Projekt besteht aus zwei Teilen:
+This project implements a simple encrypted file sync system with two components:
 
-- **`server/`** – ein PHP-Server, der verschlüsselte Dateien/Ordner von mehreren
-  Clients entgegennimmt, verwaltet und wieder ausliefert (Metadaten in SQLite).
-- **`client/`** – ein Rust-Kommandozeilen-Client, der einen lokalen Ordner mit
-  dem Server abgleicht – inklusive Löschungen, `.syncignore`, Parallelisierung,
-  optionalem Dauerbetrieb (Watch-Modus), Robustheit gegenüber
-  Netzwerkfehlern (automatische Wiederholungen, Lockfile, Livelock-Schutz)
-  und chunkweisem Streaming auch sehr großer Dateien (kein vollständiges
-  Laden in den Arbeitsspeicher).
+- `server/` – a PHP server that accepts, stores and serves encrypted files/folders from multiple clients. Metadata is stored in SQLite.
+- `client/` – a Rust command-line client that synchronizes a local folder with the server. Features include deletions, `.syncignore`, parallel transfers, optional continuous operation (watch mode), network robustness (automatic retries, lockfile, livelock protection), and chunked streaming of very large files (no full-file buffering in RAM).
 
-## Funktionsweise / Sicherheitskonzept
+## How it works / Security model
 
-- Die **Verschlüsselung findet ausschließlich auf dem Client** statt (AES-256-GCM).
-  Das Passwort wird niemals an den Server übertragen.
-- Der Schlüssel wird aus dem Passwort mit **Argon2id** (echtes, speicher- und
-  rechenhartes Passwort-KDF) unter Verwendung eines **Salts** abgeleitet.
-- Das Salt ist kein Geheimnis, muss aber für alle Clients, die denselben
-  Datenbestand synchronisieren, identisch sein. Es wird deshalb einmalig
-  zufällig vom Server erzeugt, dauerhaft gespeichert und über `/api/salt.php`
-  an die Clients ausgeliefert. Der Server erfährt dabei nie das Passwort selbst.
-- Der Server speichert und liefert **nur verschlüsselte Blobs** aus. Er kennt
-  weder den Klartext-Inhalt noch das Passwort.
-- Enthält ein Ordner **mehrere Dateien direkt** (nicht in Unterordnern), werden
-  diese vom Client zu einem **ZIP-Archiv gepackt**, anschließend verschlüsselt
-  und als eine Einheit hochgeladen. Enthält ein Ordner nur **eine** Datei, wird
-  diese einzeln übertragen.
-- Jeder Client hat einen eigenen **API-Key** (Authentifizierung gegenüber dem
-  Server – NICHT die Verschlüsselung). Mehrere Clients mit demselben
-  Verschlüsselungs-Passwort können so denselben Datenbestand synchron halten.
+- All encryption is performed on the client side only (AES-256-GCM). The password is never sent to the server.
+- Keys are derived from the password using Argon2id (a memory- and CPU-hard password KDF) with a salt.
+- The salt is not secret, but must be the same for all clients that synchronize the same dataset. The server generates a random salt once, stores it, and exposes it via `/api/salt.php`. The server never learns the password itself.
+- The server stores and serves only encrypted blobs. It never sees plaintext or the password.
+- If a folder contains multiple files directly (not nested in subfolders), the client packs those files into a ZIP archive, then encrypts and uploads that archive as a single unit. If a folder contains only a single file, that file is uploaded individually.
+- Each client authenticates to the server with its own API key (this is for server authentication only — not the encryption key). Different clients that share the same encryption password can synchronize the same dataset.
 
-```
-Client A  --(AES-256-GCM verschlüsselt)-->  PHP-Server  --(verschlüsselt)-->  Client B
-   |                                        speichert nur                        |
-   |                                        Chiffretext + Metadaten (SQLite)     |
-   +-------------------- gemeinsames Passwort (nie übertragen) ------------------+
+Diagram:
+
+Client A --(AES-256-GCM encrypted)--> PHP Server (stores ciphertext + metadata in SQLite) --(encrypted)--> Client B
+          \------------------ shared password (never transmitted) ------------------/
+
+## 1. Server setup
+
+1. Open `server/config.php` and assign an API key for each client:
+
+```php
+'api_keys' => [
+    'client1' => 'your-secret-key-1',
+    'client2' => 'your-secret-key-2',
+],
 ```
 
-## 1. Server einrichten
+2. Ensure the PHP `pdo_sqlite` extension is enabled (metadata is stored in SQLite). On Debian/Ubuntu: `apt install php-sqlite3`.
 
-1. `server/config.php` öffnen und für jeden Client einen eigenen API-Key
-   vergeben:
+3. Start the server. For local testing you can use the built-in PHP server:
 
-   ```php
-   'api_keys' => [
-       'client1' => 'ihr-eigener-geheimer-schluessel-1',
-       'client2' => 'ihr-eigener-geheimer-schluessel-2',
-   ],
-   ```
+```bash
+cd server
+php -S 0.0.0.0:8080 -t .
+```
 
-2. PHP-Erweiterung `pdo_sqlite` muss aktiv sein (Metadaten liegen in SQLite,
-   z. B. `apt install php-sqlite3`).
+For production use Apache or Nginx + PHP-FPM behind a TLS-terminating reverse proxy (see "Known limitations"). Important: `server/storage/` must NOT be directly accessible over HTTP. The included `.htaccess` in `storage/` blocks this for Apache; for Nginx add a rule like `location /storage/ { deny all; }`.
 
-3. Server starten (z. B. lokal zum Testen mit dem eingebauten PHP-Server):
+4. The server provides the following endpoints. All requests must include the header `X-API-Key: <key>`:
 
-   ```bash
-   cd server
-   php -S 0.0.0.0:8080 -t .
-   ```
+| Endpoint            | Method | Purpose                                          |
+|---------------------|--------|--------------------------------------------------|
+| `/api/list.php`     | GET    | List all entries (including tombstones)          |
+| `/api/upload.php`   | POST   | Upload an encrypted blob                         |
+| `/api/download.php` | GET    | Download an encrypted blob                       |
+| `/api/delete.php`   | POST   | Report a deletion (creates a tombstone)          |
+| `/api/salt.php`     | GET    | Retrieve / create the public Argon2id salt       |
 
-   Für den Produktivbetrieb: Apache/Nginx + PHP-FPM verwenden, dahinter
-   idealerweise per Reverse Proxy mit HTTPS (siehe "Bekannte Einschränkungen").
-   Wichtig: `server/storage/` darf **nicht** direkt über HTTP erreichbar sein
-   (die mitgelieferte `.htaccess` in `storage/` blockt dies für Apache;
-   bei Nginx entsprechend `location /storage/ { deny all; }` ergänzen).
+### Metadata storage (SQLite)
 
-4. Der Server stellt folgende Endpunkte bereit (jeweils mit Header
-   `X-API-Key: <key>`):
+Instead of one JSON file per entry, metadata is stored in `server/storage/meta.sqlite3` (a `files` table). This scales far better than thousands of single metadata files. The encrypted ciphertext blobs themselves are stored individually under `server/storage/data/`.
 
-   | Endpoint            | Methode | Zweck                                        |
-   |---------------------|---------|-----------------------------------------------|
-   | `/api/list.php`     | GET     | Liste aller Einheiten (inkl. Tombstones)       |
-   | `/api/upload.php`   | POST    | Verschlüsselten Blob hochladen                 |
-   | `/api/download.php` | GET     | Verschlüsselten Blob herunterladen             |
-   | `/api/delete.php`   | POST    | Eintrag löschen (legt einen Tombstone an)      |
-   | `/api/salt.php`     | GET     | Öffentliches Argon2id-Salt abrufen/erzeugen    |
+### Deletions (Tombstones)
 
-### Metadaten-Speicherung (SQLite)
+When a client deletes a file/folder locally, it informs the server via `/api/delete.php`. The server removes only the encrypted blob but retains a metadata entry with `deleted=1` (a "tombstone"). Other clients will see this tombstone on next sync and delete the file locally as well — preventing an accidental re-creation during sync.
 
-Statt einer JSON-Datei pro Eintrag liegen die Metadaten in
-`server/storage/meta.sqlite3` (eine Tabelle `files`). Das skaliert deutlich
-besser als tausende Einzeldateien im Dateisystem. Die verschlüsselten
-Chiffretext-Blobs selbst liegen weiterhin einzeln unter `server/storage/data/`.
+If a file previously deleted is uploaded again with the same path, the upload automatically clears the tombstone and the entry is revived.
 
-### Löschungen (Tombstones)
+Tombstones are not purged automatically. For maintenance there is `Storage::purgeOldTombstones($maxAgeSeconds)`, which can be invoked by a cron job to permanently remove old tombstones (e.g. older than 90 days).
 
-Löscht ein Client eine Datei/einen Ordner lokal, meldet er das per
-`/api/delete.php` an den Server. Der Server **entfernt dabei nur den
-verschlüsselten Blob**, behält aber einen Metadaten-Eintrag mit `deleted=1`
-("Tombstone"). So sehen alle anderen Clients beim nächsten Sync, dass die
-Datei absichtlich gelöscht wurde, und entfernen sie ebenfalls lokal – statt
-sie beim nächsten Abgleich versehentlich wiederherzustellen.
+## 2. Build the client
 
-Wird eine gelöschte Datei später wieder mit demselben Pfad angelegt, "belebt"
-ein erneuter Upload den Eintrag automatisch wieder (Tombstone wird aufgehoben).
-
-Tombstones werden nicht automatisch endgültig entfernt. Für die Wartung gibt
-es `Storage::purgeOldTombstones($maxAgeSeconds)`, das sich z. B. per
-Cronjob-Skript aufrufen lässt, um alte Tombstones (z. B. älter als 90 Tage)
-endgültig aus der Datenbank zu löschen.
-
-## 2. Client bauen
-
-Voraussetzung: Rust/Cargo (getestet mit Rust 1.75+).
+Requirements: Rust/Cargo (tested with Rust 1.75+).
 
 ```bash
 cd client
 cargo build --release
 ```
 
-Die fertige Binary liegt danach unter `target/release/sync-client`.
+The compiled binary will be available at `target/release/sync-client`.
 
-## 3. Client benutzen
+## 3. Using the client
+
+Basic one-shot sync:
 
 ```bash
 ./target/release/sync-client \
   --server http://localhost:8080 \
-  --api-key ihr-eigener-geheimer-schluessel-1 \
-  --dir /pfad/zum/sync-ordner
+  --api-key your-secret-key-1 \
+  --dir /path/to/sync-folder
 ```
 
-Der Client fragt das Passwort dabei sicher (ohne Bildschirmausgabe) interaktiv ab.
+The client securely prompts for the encryption password (no terminal echo).
 
-- `--server`   Basis-URL des PHP-Servers
-- `--api-key`  API-Key dieses Clients (siehe `config.php`)
-- `--dir`      lokaler Ordner, der synchronisiert werden soll
+CLI options:
 
-Jeder Sync-Lauf schließt mit einer Zusammenfassungszeile ab, die auf einen
-Blick zeigt, was passiert ist:
+- `--server`   Base URL of the PHP server
+- `--api-key`  API key for this client (see `config.php`)
+- `--dir`      Local folder to synchronize
+
+Each sync run prints a short summary of actions:
 
 ```
-Hochgeladen: urlaub/__archive__.zip
-Heruntergeladen: bericht.docx
-Löschung an Server gemeldet: alter_entwurf.txt
-Zusammenfassung: 1 hochgeladen, 1 heruntergeladen, 1 gelöscht, 42 unverändert.
+Uploaded: vacation/__archive__.zip
+Downloaded: report.docx
+Reported deletion to server: old_draft.txt
+Summary: 1 uploaded, 1 downloaded, 1 deleted, 42 unchanged.
 ```
 
-Das gilt auch für `--dry-run` (dort mit "hochzuladen"/"herunterzuladen"/"zu
-löschen" statt der abgeschlossenen Form) sowie für jeden einzelnen Durchlauf
-im Watch-Modus.
+This also applies to `--dry-run` (where actions are described in conditional form) and to each run inside watch mode.
 
-#### Passwort sicher übergeben
+#### Passing the password securely
 
-Das Verschlüsselungspasswort **muss bei allen Clients, die denselben
-Datenbestand teilen sollen, identisch sein**. Es gibt drei Wege, es zu
-übergeben (in dieser Reihenfolge geprüft):
+All clients that share the same dataset must use the same encryption password. The client supports three ways to supply the password (checked in this order):
 
-1. **`--password "..."`** – funktioniert, ist aber unsicher: andere lokale
-   Nutzer sehen das Passwort über die Prozessliste (`ps aux`), und es landet
-   in der Shell-History. Der Client gibt bei Verwendung eine Warnung aus.
-2. **Umgebungsvariable `SYNC_PASSWORD`** – nicht in der Prozessliste
-   sichtbar, geeignet für Skripte/Cronjobs/CI:
-   ```bash
-   export SYNC_PASSWORD="IhrGeheimesSyncPasswort"
-   ./target/release/sync-client --server http://localhost:8080 --api-key ... --dir ...
-   ```
-3. **Interaktive Abfrage** (Standard, wenn weder 1. noch 2. angegeben ist) –
-   sicherste Variante für die manuelle Nutzung am Terminal, das Passwort wird
-   nicht angezeigt und landet nirgends im Klartext. Funktioniert nicht ohne
-   Terminal (z. B. in einem Cronjob ohne TTY) – dort `SYNC_PASSWORD` verwenden.
-
-Ein einmaliger Aufruf synchronisiert in beide Richtungen:
-
-1. Lokale neue/geänderte Dateien werden verschlüsselt hochgeladen.
-2. Auf dem Server neue/geänderte Einheiten werden heruntergeladen,
-   entschlüsselt und (falls es sich um ein Archiv handelt) automatisch
-   entpackt.
-3. Lokal gelöschte Dateien werden dem Server gemeldet (Tombstone); vom Server
-   gemeldete Löschungen werden lokal übernommen (siehe oben).
-4. Bei echten Konflikten (Änderung auf beiden Seiten seit dem letzten Sync)
-   gewinnt die Version mit der neueren Änderungszeit.
-5. Alle anstehenden Uploads/Downloads/Löschungen laufen **parallel**
-   (standardmäßig bis zu 8 gleichzeitig) statt strikt nacheinander.
-
-### Watch-Modus (Dauerbetrieb)
+1. `--password "..."` — works but insecure: other local users can see the password via process listings (`ps aux`) and it may end up in shell history. The client warns when this is used.
+2. Environment variable `SYNC_PASSWORD` — not visible in process listings, suitable for scripts/cron/CI:
 
 ```bash
-export SYNC_PASSWORD="IhrGeheimesSyncPasswort"
+export SYNC_PASSWORD="YourSecretSyncPassword"
+./target/release/sync-client --server http://localhost:8080 --api-key ... --dir ...
+```
+
+3. Interactive prompt (default if neither 1 nor 2 is provided) — the safest option for manual terminal usage: the password is not echo'ed and not stored anywhere. This mode requires a terminal (won't work in a cron job without a TTY — use `SYNC_PASSWORD` there).
+
+A single run synchronizes in both directions:
+
+1. Local new/changed files are encrypted and uploaded.
+2. New/changed entries on the server are downloaded, decrypted, and if they are archives, automatically unpacked.
+3. Local deletions are reported to the server (tombstone); deletions reported by the server are applied locally.
+4. On true conflicts (both sides changed since last sync), the version with the newer modification time wins.
+5. Uploads/downloads/deletions are performed in parallel (by default up to 8 concurrent transfers).
+
+### Watch mode (continuous operation)
+
+Example:
+
+```bash
+export SYNC_PASSWORD="YourSecretSyncPassword"
 ./target/release/sync-client \
   --server http://localhost:8080 \
-  --api-key ihr-eigener-geheimer-schluessel-1 \
-  --dir /pfad/zum/sync-ordner \
+  --api-key your-secret-key-1 \
+  --dir /path/to/sync-folder \
   --watch
 ```
 
-(Im Dauerbetrieb ist `SYNC_PASSWORD` praktisch die einzig sinnvolle Option –
-eine interaktive Abfrage würde den Prozess sonst sofort beim Start blockieren.)
+In watch mode `SYNC_PASSWORD` is the practical choice (interactive prompt would block the daemon on startup).
 
-Im Watch-Modus läuft der Client dauerhaft:
+While running in watch mode the client:
 
-- Er überwacht `--dir` auf Dateisystem-Änderungen und synchronisiert dann
-  automatisch (entprellt über `--debounce-ms`, Standard 1500 ms, damit z. B.
-  das Kopieren vieler Dateien nicht dutzende Syncs auslöst).
-- Zusätzlich wird mindestens alle `--interval` Sekunden (Standard 30)
-  synchronisiert, auch ohne lokales Ereignis – das fängt Änderungen ab, die
-  **andere Clients** auf dem Server vorgenommen haben.
+- Watches `--dir` for filesystem changes and syncs automatically (debounced via `--debounce-ms`, default 1500 ms to avoid many rapid syncs when copying many files).
+- Also syncs at least every `--interval` seconds (default 30) even without local events — to pick up changes made by other clients on the server.
 
-Für Server ohne Dauerbetrieb-Wunsch kann stattdessen weiterhin ein einmaliger
-Aufruf per Cronjob/Taskplaner wiederholt werden.
+If you prefer not to run a continuous client, you can run the client periodically via cron or a scheduled task.
 
-### Robustheit bei Netzwerkfehlern & Nebenläufigkeit
+### Network robustness & concurrency
 
-**Automatische Wiederholungen bei transienten Fehlern.** Jede Anfrage an den
-Server wird bei Verbindungsabbrüchen, Timeouts oder 5xx-Serverfehlern
-automatisch mit exponentiellem Backoff wiederholt (`--retries`, Standard 3
-Versuche; `--retry-delay-ms`, Standard 500 ms Basis-Wartezeit, verdoppelt sich
-pro Versuch: 500 ms, 1000 ms, 2000 ms, …). Bei dauerhaften Fehlern (4xx, z. B.
-falscher API-Key oder ungültiger Pfad) wird dagegen sofort ohne Wiederholung
-abgebrochen, da ein erneuter Versuch daran nichts ändern würde:
+- Automatic retries for transient errors: requests that fail due to connectivity issues, timeouts or server 5xx errors are retried with exponential backoff (`--retries`, default 3 attempts; `--retry-delay-ms`, default base 500 ms, doubling each attempt: 500 ms, 1000 ms, 2000 ms, ...). Permanent client errors (4xx, e.g. wrong API key) are not retried.
+
+Example:
 
 ```
-Warnung: Upload von urlaub/__archive__.zip fehlgeschlagen (Versuch 1/3),
-erneuter Versuch in 0.5s...
-Warnung: Upload von urlaub/__archive__.zip fehlgeschlagen (Versuch 2/3),
-erneuter Versuch in 1.0s...
-Hochgeladen: urlaub/__archive__.zip
+Warning: Upload of vacation/__archive__.zip failed (attempt 1/3), retrying in 0.5s...
+Warning: Upload of vacation/__archive__.zip failed (attempt 2/3), retrying in 1.0s...
+Uploaded: vacation/__archive__.zip
 ```
 
-Das macht kurze Netzwerkaussetzer (WLAN-Hänger, kurzer Server-Neustart) für
-den Dauerbetrieb (`--watch`) unkritisch, ohne dass gleich der ganze Sync-Lauf
-fehlschlägt.
+- Lockfile against concurrent sync runs: the client creates `.sync.lock` inside the sync folder containing its process ID and holds it for the duration of the run. If another process tries to sync the same folder, it aborts with a clear error to avoid corrupting the local cache (`.sync_cache.json`).
 
-**Lockfile gegen parallele Sync-Läufe.** Beim Start legt der Client im
-Sync-Ordner eine `.sync.lock`-Datei mit seiner Prozess-ID an und hält sie für
-die gesamte Laufzeit. Versucht ein zweiter Prozess (z. B. ein manueller Aufruf
-während der Watch-Modus bereits läuft, oder zwei parallel gestartete
-Cronjobs), denselben Ordner zu synchronisieren, bricht er sofort mit einer
-klaren Fehlermeldung ab, statt sich mit dem ersten Prozess den lokalen Cache
-(`.sync_cache.json`) gegenseitig zu überschreiben:
+Example error:
 
 ```
-Error: Ein anderer Sync-Prozess (PID 12345) scheint bereits für diesen
-Ordner zu laufen (Lockdatei: /pfad/zum/sync-ordner/.sync.lock).
-Falls das nicht stimmt (z. B. nach einem Absturz oder harten Kill), löschen
-Sie die Datei manuell und versuchen Sie es erneut.
+Error: Another sync process (PID 12345) appears to be running for this folder (lockfile: /path/to/sync-folder/.sync.lock).
+If this is not the case (e.g. after a crash), delete the file manually and try again.
 ```
 
-Stürzt ein Client ab oder wird hart beendet (`kill -9`), bevor er die
-Lockdatei wieder aufräumen konnte, erkennt der nächste Client das automatisch:
-Unter Linux wird geprüft, ob die in der Lockdatei vermerkte Prozess-ID noch
-existiert (`/proc/<pid>`); ist das nicht der Fall, gilt der Lock als verwaist
-und wird automatisch übernommen. Auf Plattformen ohne `/proc` greift ersatzweise
-eine Alters-Schwelle (Lockdateien älter als 6 Stunden gelten als verwaist).
+If a client crashes or is hard-killed (`kill -9`) and cannot remove the lockfile, the next client detects this: on Linux it checks whether the recorded PID still exists (`/proc/<pid>`); if not, the lock is considered stale and is claimed automatically. On systems without `/proc`, a time threshold is used (locks older than 6 hours are assumed orphaned).
 
-**Livelock-Schutz im Watch-Modus.** Ohne Gegenmaßnahme könnte ein sehr lange
-laufender, kontinuierlicher Schreibvorgang im Sync-Ordner (z. B. ein
-stundenlanges Backup-Tool, das laufend neue Dateien anlegt) das
-Debounce-Fenster (`--debounce-ms`) immer wieder aufs Neue anstoßen und den
-Sync so theoretisch auf unbestimmte Zeit verschieben. Der Client merkt sich
-deshalb zusätzlich den Zeitpunkt des *ersten* noch nicht synchronisierten
-Ereignisses und synchronisiert spätestens nach `--max-debounce-wait-ms`
-(Standard 60 000 ms = 60 s) trotzdem, auch wenn weiterhin neue Ereignisse
-eintreffen:
+- Livelock protection in watch mode: a long-running continuous write operation (for example a backup process constantly creating files) could keep re-triggering the debounce window and postpone syncing indefinitely. The client records the time of the first unsynced event and forces a sync after `--max-debounce-wait-ms` (default 60000 ms = 60 s), even if new events keep coming:
 
 ```
-Anhaltende Aktivität im Sync-Ordner erkannt – synchronisiere trotzdem
-(Obergrenze 60000 ms erreicht), statt weiter zu warten.
+Ongoing activity in sync folder detected — syncing anyway (max debounce 60000 ms reached).
 ```
 
-### Streaming großer Dateien
+### Streaming large files
 
-Weder Client noch Server laden eine Datei jemals komplett in den
-Arbeitsspeicher. Das gilt für den gesamten Weg einer Datei:
+Neither client nor server ever load whole files into RAM. This applies throughout the file lifecycle:
 
-- **Hashing** (Änderungserkennung): liest die Datei blockweise (64 KiB) von
-  der Festplatte, statt sie einzulesen und dann zu hashen.
-- **ZIP-Bau** bei Mehrdatei-Ordnern: jede enthaltene Datei wird direkt beim
-  Packen auf die Festplatte gestreamt (`.sync_tmp/…`), nie im Speicher
-  zusammengesetzt.
-- **Verschlüsselung/Entschlüsselung**: AES-256-GCM im STREAM-Modus
-  (`aes-gcm`-Crate, `EncryptorBE32`/`DecryptorBE32`) verarbeitet die Datei in
-  1-MiB-Chunks, jeder Chunk einzeln authentifiziert (kein "alles oder
-  nichts" wie beim naiven Verschlüsseln der gesamten Datei in einem Stück).
-  Das Format einer verschlüsselten Datei ist:
-  `7-Byte-Nonce-Präfix || Chunk_1 || Chunk_2 || … || letzter_Chunk`, wobei
-  jeder Chunk aus bis zu 1 MiB Klartext plus einem 16-Byte-Auth-Tag besteht.
-- **Übertragung**: der Upload liest die verschlüsselte Datei blockweise von
-  der Festplatte in den HTTP-Body (`multipart::Part::file`, kein Laden in
-  einen Byte-Puffer); der Download schreibt die Server-Antwort blockweise
-  direkt in eine Datei (`Response::copy_to`).
-- **Serverseitig** kopiert PHP die hochgeladene Datei per `copy()` direkt an
-  ihren Zielort und hasht sie mit `hash_file()` (beides streamend), statt
-  `file_get_contents()`/`hash()` auf dem kompletten Inhalt aufzurufen; der
-  Download nutzt `readfile()` statt den Inhalt vorher als PHP-String zu
-  materialisieren.
+- Hashing (change detection): files are read blockwise (64 KiB) from disk for hashing.
+- ZIP creation for multi-file folders: each file is streamed to disk while building the ZIP (temporary files under `.sync_tmp/...`), never assembled fully in memory.
+- Encryption/decryption: AES-256-GCM in streaming mode (`aes-gcm` crate, `EncryptorBE32`/`DecryptorBE32`) processes files in 1 MiB chunks; each chunk is individually authenticated. The encrypted file format is:
 
-In Tests blieb der Speicherbedarf bei einer 500-MB-Testdatei sowohl beim
-Client (Upload wie Download) als auch beim PHP-Server durchgehend im
-niedrigen zweistelligen Megabyte-Bereich – unabhängig von der Dateigröße.
+```
+7-byte nonce prefix || Chunk_1 || Chunk_2 || … || last_chunk
+```
 
-**Wichtig für den Betrieb:** PHPs eigene `upload_max_filesize`- und
-`post_max_size`-ini-Einstellungen begrenzen unabhängig von diesem Projekt,
-wie groß eine einzelne Anfrage sein darf (Standard in vielen Distributionen:
-2 MB / 8 MB!). Für größere Dateien müssen diese Werte sowie
-`config.php`s `max_upload_size` entsprechend angehoben werden, z. B.:
+Each chunk contains up to 1 MiB of plaintext plus a 16-byte auth tag.
+
+- Transfer: uploads read the encrypted file from disk in blocks into the HTTP body (`multipart::Part::file`, no in-memory buffering); downloads write the server response blockwise to disk (`Response::copy_to`).
+- Server-side PHP copies the uploaded file with `copy()` and hashes with `hash_file()` (both streaming), instead of reading the entire content into a PHP string; downloads use `readfile()`.
+
+In tests a 500 MB file kept both client (upload and download) and PHP server memory usage in the low double-digit megabyte range, independent of file size.
+
+Important: PHP's `upload_max_filesize` and `post_max_size` INI limits still constrain request sizes (many distributions default to 2 MB / 8 MB). For large files increase these values and `config.php`'s `max_upload_size`. Example for a temporary server process:
 
 ```bash
 php -d upload_max_filesize=2G -d post_max_size=2G -S 0.0.0.0:8080 -t server
 ```
 
-oder dauerhaft in der `php.ini` bzw. der Apache/Nginx-PHP-FPM-Konfiguration.
+Or change them permanently in `php.ini` or your PHP-FPM configuration.
 
-### Sicherheitsnetz gegen Massenlöschung (Löschschwelle) & `--dry-run`
+### Safety net against mass deletions (delete threshold) & `--dry-run`
 
-Da Löschungen automatisch zwischen allen Clients propagiert werden (siehe
-oben), könnte ein einziger Fehlaufruf mit falschem/leerem `--dir` (Tippfehler
-im Pfad, nicht gemountetes Netzlaufwerk, versehentlich umbenannter Ordner)
-sonst dazu führen, dass der komplette bisherige Datenbestand bei **allen**
-Clients gelöscht wird – der Client "sieht" ja nur einen leeren Ordner und
-schließt daraus, dass alles gelöscht wurde.
-
-Deshalb gilt: Würden mehr als **30 % der zuvor bekannten Dateien/Ordner**
-gelöscht, bricht der Sync standardmäßig ab, **ohne irgendetwas zu
-verändern**:
+Since deletions are propagated automatically across clients, a mistaken invocation (wrong/empty `--dir`, unmounted network volume, etc.) could otherwise cause mass deletion on all clients. To avoid accidental catastrophic deletions, the client aborts by default if more than 30% of previously known entries would be deleted:
 
 ```
-$ ./target/release/sync-client --server ... --api-key ... --dir /pfad
-Error: Abgebrochen: 214 von 214 zuvor bekannten Einheiten (100 %) würden
-gelöscht – das überschreitet die Löschschwelle von 30 %.
-Das ist oft ein Zeichen für ein falsches oder (noch) leeres --dir ...
-Prüfen Sie den geplanten Sync mit --dry-run, oder erzwingen Sie ihn bewusst
-mit --force.
+$ ./target/release/sync-client --server ... --api-key ... --dir /path
+Error: Aborted: 214 of 214 previously known entries (100%) would be deleted — this exceeds the delete threshold of 30%.
+This often indicates a wrong or empty --dir. Inspect the planned sync with --dry-run, or force it with --force.
 ```
 
-Optionen dafür:
+Options:
 
-- **`--dry-run`** – zeigt an, was eine Synchronisation tun würde (jede
-  einzelne geplante Aktion plus eine Zusammenfassung), ohne irgendetwas zu
-  verändern: kein Upload, kein Download, keine Löschung, nicht einmal der
-  lokale Cache wird geschrieben. Empfehlenswert vor dem ersten Sync in einem
-  neuen/umgezogenen Ordner oder nach Änderungen an der `.syncignore`.
-- **`--force`** – führt den Sync trotz überschrittener Löschschwelle bewusst
-  aus (z. B. wenn tatsächlich gewollt viele Dateien aufgeräumt wurden). Der
-  Client weist dabei weiterhin per Warnung darauf hin, wie viel gelöscht wird.
-- **`--delete-threshold <Prozent>`** – passt die Schwelle an (Standard 30).
-  `--delete-threshold 100` deaktiviert die Sicherung praktisch vollständig,
-  `--delete-threshold 0` lässt schon eine einzige Löschung abbrechen.
+- `--dry-run` — show what the sync would do (each planned action and a summary) without making any changes: no uploads, no downloads, no deletions, not even writing the local cache. Recommended before the first sync in a new/moved folder or after changing `.syncignore`.
+- `--force` — perform the sync even if the delete threshold would be exceeded (useful for intentional mass cleanups). The client still prints a warning about how many would be deleted.
+- `--delete-threshold <percent>` — override the default threshold (default 30). `--delete-threshold 100` effectively disables the safeguard; `--delete-threshold 0` aborts on any deletion.
 
-Die Schwelle bezieht sich auf den Anteil an den Einheiten, die dem Client aus
-seinem **eigenen letzten Sync** (dem lokalen `.sync_cache.json`) bekannt
-waren – nicht auf die absolute Zahl. Bei einem brandneuen Sync-Ordner (leerer
-Cache) greift sie nicht, da noch nichts "bekannt" ist, das verloren gehen
-könnte.
+The threshold is computed relative to the entries known from the client's own last sync (local `.sync_cache.json`), not absolute numbers. For a brand-new sync folder (empty cache) the threshold does not apply.
 
 ### `.syncignore`
 
-Im Sync-Ordner kann eine `.syncignore`-Datei (ähnlich `.gitignore`, bewusst
-einfacher) angelegt werden, um Dateien/Ordner von der Synchronisation
-auszuschließen:
+Place a `.syncignore` file in the sync folder to exclude files/folders from synchronization (similar to `.gitignore`, intentionally simpler):
 
 ```
-# Kommentare beginnen mit #
+# Comments start with #
 *.tmp
 *.log
 node_modules/
 .cache/
-notes/geheim.txt
+notes/secret.txt
 ```
 
-- Eine Zeile = ein Muster (Glob-Syntax, z. B. `*.tmp`).
-- Ein abschließendes `/` markiert einen ganzen Ordner (inkl. Inhalt).
-- Muster werden sowohl gegen den relativen Pfad als auch gegen den reinen
-  Dateinamen geprüft.
-- `.git`-Ordner und die interne `.sync_cache.json` sind immer implizit
-  ausgeschlossen.
+- One pattern per line (glob syntax, e.g. `*.tmp`).
+- A trailing `/` marks a whole folder (including contents).
+- Patterns are matched against both the relative path and the basename.
+- `.git` and the internal `.sync_cache.json` are always implicitly excluded.
 
-**Achtung:** Wird eine bereits synchronisierte Datei nachträglich per
-`.syncignore` ausgeschlossen, behandelt der Client sie beim nächsten Sync wie
-eine lokale Löschung und meldet sie dem Server (Tombstone) – sie verschwindet
-dann auch bei allen anderen Clients. Das ist beabsichtigt ("nicht mehr
-synchronisieren" wird als "hier entfernen" interpretiert), sollte aber bewusst
-eingesetzt werden.
+Caution: If a file that was previously synced is later added to `.syncignore`, the client treats it as a local deletion on the next sync and reports it to the server (creates a tombstone) — it will then be removed from other clients as well. This behavior is deliberate: "stop syncing this file" is interpreted as "remove it from the shared dataset".
 
-### Beispiel
+### Example layout
 
 ```
-sync-ordner/
+sync-folder/
 ├── .syncignore
-├── bericht.docx          -> wird einzeln übertragen
-└── urlaubsfotos/
-    ├── bild1.jpg
-    ├── bild2.jpg
-    └── bild3.jpg         -> Ordner mit mehreren Dateien wird als
-                              "urlaubsfotos/__archive__.zip" (verschlüsselt)
-                              auf dem Server gespeichert
+├── report.docx          -> transferred as a single file
+└── vacation-photos/
+    ├── photo1.jpg
+    ├── photo2.jpg
+    └── photo3.jpg       -> folder with multiple files is stored on the server
+                          as "vacation-photos/__archive__.zip" (encrypted)
 ```
 
-## Bekannte Einschränkungen (bewusst einfach gehalten)
+## Known limitations (intentionally simple)
 
-- Wechselt ein Ordner zwischen "eine Datei" und "mehrere Dateien", entsteht
-  auf dem Server ein neuer Eintrag; der alte Pfad wird dabei automatisch als
-  gelöscht gemeldet (Tombstone) – das ist inzwischen automatisiert, erzeugt
-  aber weiterhin zwei getrennte historische Einträge in der Datenbank.
-- Es gibt weiterhin keine Versionierung für **inhaltliche** Konflikte: Ändern
-  zwei Clients dieselbe Datei zwischen zwei Syncs unabhängig voneinander,
-  gewinnt schlicht die Version mit der neueren mtime (abhängig von der
-  Systemuhr der jeweiligen Clients) – die unterlegene Version geht verloren.
-  Das Lockfile (siehe oben) schützt nur vor *gleichzeitigen Sync-Läufen*
-  desselben Clients/Ordners, nicht vor solchen inhaltlichen Konflikten
-  zwischen verschiedenen Clients.
-- Transportverschlüsselung (HTTPS) ist nicht Teil dieses Projekts – für den
-  Produktivbetrieb unbedingt einen TLS-terminierenden Reverse Proxy
-  davorschalten.
-- Metadaten (Dateinamen, Pfade, Größen, Zeitstempel) sind auf dem Server
-  nicht verschlüsselt, nur die Dateiinhalte selbst.
-- Große Dateien werden zwar chunkweise verschlüsselt und übertragen (siehe
-  "Streaming großer Dateien" oben), aber bei jeder Änderung komplett neu
-  übertragen; es gibt keine Fortsetzung abgebrochener Übertragungen auf
-  Chunk-Ebene (die Retry-Logik wiederholt bei einem Abbruch den kompletten
-  Transfer der Datei, nicht nur den fehlenden Rest) und keine binäre
-  Differenzübertragung (Delta-Sync) bei kleinen Änderungen in großen Dateien.
+- If a folder flips between "one file" and "multiple files", the server will create a new entry and mark the old path as deleted (tombstone). This is automated but results in two separate historical entries in the DB.
+- There is no content-versioning for true edit conflicts: if two clients independently modify the same file between syncs, the version with the newer mtime wins (depends on clients' system clocks) — the other version is lost. The lockfile protects only against concurrent sync runs of the same client/folder, not against content conflicts between different clients.
+- Transport TLS is not part of this project — use a TLS-terminating reverse proxy in production.
+- Metadata (filenames, paths, sizes, timestamps) are not encrypted on the server — only file contents are encrypted.
+- While files are chunk-encrypted and streamed, changes cause a full re-transfer: there is no chunk-level resume or binary delta sync. A retry on an interrupted transfer repeats the entire file transfer, not just missing chunks.
